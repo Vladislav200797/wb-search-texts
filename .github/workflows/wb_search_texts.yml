@@ -2,33 +2,48 @@ name: WB Search Texts → Supabase (daily 07:00 MSK)
 
 on:
   schedule:
-    - cron: "0 4 * * *"   # 04:00 UTC == 07:00 MSK
-  workflow_dispatch: {}
+    - cron: "0 4 * * *"      # 04:00 UTC == 07:00 MSK
+  workflow_dispatch: {}      # ручной запуск из Actions
+
+permissions:
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Install dependencies
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run sync
+
+      - name: Run sync script
         env:
-          SUPABASE_CONN: ${{ secrets.SUPABASE_CONN }}
-          WB_SA_API_KEY: ${{ secrets.WB_SA_API_KEY }}
-          TOP_ORDER_BY: "orders"
+          # 🔐 Секреты (добавь в Settings → Secrets and variables → Actions)
+          SUPABASE_CONN: ${{ secrets.SUPABASE_CONN }}   # postgresql://postgres:<PWD>@aws-0-eu-north-1.pooler.supabase.com:6543/postgres?sslmode=require
+          WB_SA_API_KEY: ${{ secrets.WB_SA_API_KEY }}   # HeaderApiKey из WB Seller Analytics
+
+          # ⚙️ Параметры метода
+          TOP_ORDER_BY: "orders"                        # openCard|addToCart|openToCart|orders|cartToOrder
           INCLUDE_SUBSTITUTED: "true"
           INCLUDE_SEARCH_TEXTS: "true"
-          TEXT_LIMIT: "30"
+          TEXT_LIMIT: "30"                              # 100 для тарифа «Продвинутый»
           USE_PAST_PERIOD: "false"
-          DAYS_SHIFT: "1"
-          # Опциональные фильтры:
-          WB_FILTER_BRANDS: "MOORKA"
-          WB_FILTER_SUBJECTS: "Костюм детский,Костюмы"
-          WB_FILTER_VENDOR_CODES: ""
+          DAYS_SHIFT: "1"                               # берём вчера по МСК
+
+          # 🔎 Фильтры каталога (оставь пустыми, чтобы тянуть всё)
+          WB_FILTER_BRANDS: ""                          # напр.: "moorka"
+          WB_FILTER_SUBJECTS: ""                        # напр.: "костюм,костюм детский"
+          WB_FILTER_VENDOR_CODES: ""                    # напр.: "HPsetDark,HPsetBlack"
         run: |
           python wb_search_texts_sync.py
