@@ -24,26 +24,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run sync
+      - name: Run sync (yesterday only + retention 92d)
         env:
           WB_API_KEY: ${{ secrets.WB_API_KEY }}
           SUPABASE_CONNINFO: ${{ secrets.SUPABASE_CONNINFO }}
 
-          # Твой тариф (не расширенный Jam) -> лимит 30
+          # Тариф (не расширенный Jam) -> лимит 30
           LIMIT: "30"
 
-          # Больше уникальных запросов за счёт окна 7 дней
-          PERIOD_DAYS: "7"
-          PERIOD_END_OFFSET: "1"   # заканчиваем вчера (по МСК)
+          # ВЫГРУЖАЕМ ТОЛЬКО ВЧЕРА:
+          PERIOD_DAYS: "1"
+          PERIOD_END_OFFSET: "1"
 
-          # Максимальный охват: 5 разных "топов" (каждый даст свой топ-30)
+          # Максимальный охват по запросам в рамках лимита 30:
           TOP_ORDER_BYS: "openCard,addToCart,openToCart,orders,cartToOrder"
 
-          # Ключевая настройка: маленькие батчи nm_id,
-          # чтобы топ не "съедали" 2-3 самых активных товара
+          # батчи nm_id (оставляем как у тебя)
           NMID_BATCH_SIZE: "10"
 
-          # Лимиты WB: 3 запроса/мин, интервал 20 сек -> держим 21 сек запас
+          # лимиты WB
           WB_PAUSE_SEC: "21"
+
+          # РЕТЕНШН: удаляем данные старше 92 дней
+          RETENTION_DAYS: "92"
         run: |
           python wb_search_texts_sync.py
