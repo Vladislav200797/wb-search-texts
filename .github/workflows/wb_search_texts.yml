@@ -8,7 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -29,14 +29,21 @@ jobs:
           WB_API_KEY: ${{ secrets.WB_API_KEY }}
           SUPABASE_CONNINFO: ${{ secrets.SUPABASE_CONNINFO }}
 
-          # минимально: один режим, один день
-          TOP_ORDER_BYS: "orders"
+          # Твой тариф (не расширенный Jam) -> лимит 30
           LIMIT: "30"
-          PERIOD_DAYS: "1"
-          PERIOD_END_OFFSET: "1"
 
-          # техничка
-          NMID_BATCH_SIZE: "300"
+          # Больше уникальных запросов за счёт окна 7 дней
+          PERIOD_DAYS: "7"
+          PERIOD_END_OFFSET: "1"   # заканчиваем вчера (по МСК)
+
+          # Максимальный охват: 5 разных "топов" (каждый даст свой топ-30)
+          TOP_ORDER_BYS: "openCard,addToCart,openToCart,orders,cartToOrder"
+
+          # Ключевая настройка: маленькие батчи nm_id,
+          # чтобы топ не "съедали" 2-3 самых активных товара
+          NMID_BATCH_SIZE: "10"
+
+          # Лимиты WB: 3 запроса/мин, интервал 20 сек -> держим 21 сек запас
           WB_PAUSE_SEC: "21"
         run: |
           python wb_search_texts_sync.py
