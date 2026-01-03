@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
-from psycopg2.extras import execute_values
+from psycopg2.extras import execute_values, Json
 
 
 WB_BASE = "https://seller-analytics-api.wildberries.ru"
@@ -65,10 +65,6 @@ def safe_float(v: Any) -> Optional[float]:
         return None
 
 
-def chunk(lst: List[Any], n: int) -> List[List[Any]]:
-    return [lst[i:i + n] for i in range(0, len(lst), n)]
-
-
 # ---------- Postgres ----------
 
 def pg_connect() -> psycopg2.extensions.connection:
@@ -80,10 +76,6 @@ def pg_connect() -> psycopg2.extensions.connection:
 
 
 def fetch_nm_ids_from_db(conn) -> List[int]:
-    """
-    У тебя в логах видно, что это работает из public.wb_products_catalog.
-    Оставляем только его, чтобы не было сюрпризов.
-    """
     sql = "select distinct nm_id from public.wb_products_catalog where nm_id is not null"
     with conn.cursor() as cur:
         cur.execute(sql)
@@ -100,12 +92,12 @@ def upsert_rows(conn, rows: List[Tuple[Any, ...]]) -> None:
         logging.info("Нет строк для вставки.")
         return
 
-    # ВАЖНО: конфликт по (period_start, period_end, nm_id, search_text)
     sql = """
     insert into public.wb_search_texts (
       load_dttm,
       period_start,
       period_end,
+      top_order_by,
       nm_id,
       search_text,
       avg_position,
@@ -114,9 +106,10 @@ def upsert_rows(conn, rows: List[Tuple[Any, ...]]) -> None:
       orders,
       open_to_cart,
       cart_to_order,
-      open_to_order
+      open_to_order,
+      raw_item
     ) values %s
-    on conflict (period_start, period_end, nm_id, search_text)
+    on conflict (period_start, period_end, top_order_by, nm_id, search_text)
     do update set
       load_dttm     = excluded.load_dttm,
       avg_position  = excluded.avg_position,
@@ -125,7 +118,8 @@ def upsert_rows(conn, rows: List[Tuple[Any, ...]]) -> None:
       orders        = excluded.orders,
       open_to_cart  = excluded.open_to_cart,
       cart_to_order = excluded.cart_to_order,
-      open_to_order = excluded.open_to_order
+      open_to_order = excluded.open_to_order,
+      raw_item      = excluded.raw_item
     ;
     """
 
@@ -144,10 +138,6 @@ def wb_post_json(
     body: Dict[str, Any],
     max_retries_429: int = 6
 ) -> Dict[str, Any]:
-    """
-    - Логирует любые ошибки WB (код + текст ответа)
-    - Ретраит 429 (лимит) с backoff
-    """
     headers = wb_headers(api_key)
 
     for attempt in range(1, max_retries_429 + 1):
@@ -162,16 +152,14 @@ def wb_post_json(
             time.sleep(sleep_s)
             continue
 
-        # Любая другая ошибка — показываем тело
         text = resp.text or ""
-        text_short = text[:1200]  # чтобы лог не раздувать
-        logging.error(f"WB ERROR {resp.status_code} on {url}. Response (first 1200 chars): {text_short}")
+        logging.error(f"WB ERROR {resp.status_code} on {url}. Response (first 1200 chars): {text[:1200]}")
         raise RuntimeError(f"WB request failed: {resp.status_code}")
 
     raise RuntimeError("WB 429: exceeded retries")
 
 
-def fetch_search_texts_for_nmids(
+def fetch_search_texts(
     session: requests.Session,
     api_key: str,
     period_start: date,
@@ -180,47 +168,33 @@ def fetch_search_texts_for_nmids(
     limit: int,
     top_order_by: str
 ) -> List[Dict[str, Any]]:
-    """
-    Запросим в 1 батч (как у тебя уже было).
-    На Jam иногда лимит по limit может быть 30. Поэтому:
-    - пробуем limit как задано
-    - если WB упал (400) — попробуем автоматически limit=30 один раз
-    """
-    nm_batch = nm_ids  # у тебя 45 — нормально
+    body = {
+        "currentPeriod": {"start": period_start.isoformat(), "end": period_end.isoformat()},
+        "nmIds": nm_ids,
+        "topOrderBy": top_order_by,
+        "includeSubstitutedSKUs": True,
+        "includeSearchTexts": True,
+        "orderBy": {"field": "avgPosition", "mode": "asc"},
+        "limit": limit
+    }
 
-    def make_body(lim: int) -> Dict[str, Any]:
-        return {
-            "currentPeriod": {"start": period_start.isoformat(), "end": period_end.isoformat()},
-            "nmIds": nm_batch,
-            "topOrderBy": top_order_by,
-            "includeSubstitutedSKUs": True,
-            "includeSearchTexts": True,
-            "orderBy": {"field": "avgPosition", "mode": "asc"},
-            "limit": lim
-        }
-
-    logging.info(f"Запрашиваем пачку nmIds: {len(nm_batch)} (limit={limit})")
-
-    try:
-        js = wb_post_json(session, EP_SEARCH_TEXTS, api_key, make_body(limit))
-    except RuntimeError:
-        # fallback: часто бывает, что limit=100 недоступен, а limit=30 ок
-        if limit != 30:
-            logging.warning("Пробуем fallback limit=30 (если у WB ограничение на тарифе)")
-            js = wb_post_json(session, EP_SEARCH_TEXTS, api_key, make_body(30))
-        else:
-            raise
+    logging.info(f"Запрашиваем nmIds: {len(nm_ids)} (limit={limit}, topOrderBy={top_order_by})")
+    js = wb_post_json(session, EP_SEARCH_TEXTS, api_key, body)
 
     data = js.get("data") or {}
     items = data.get("items") or []
-    clean_items = [it for it in items if isinstance(it, dict)]
-    return clean_items
+    return [it for it in items if isinstance(it, dict)]
 
 
-def build_db_rows(period_start: date, period_end: date, items: List[Dict[str, Any]]) -> List[Tuple[Any, ...]]:
+def build_db_rows(
+    period_start: date,
+    period_end: date,
+    top_order_by: str,
+    items: List[Dict[str, Any]]
+) -> List[Tuple[Any, ...]]:
     load_dttm = datetime.now(UTC)
-
     rows: List[Tuple[Any, ...]] = []
+
     for it in items:
         nm_id = it.get("nmId") or it.get("nmID")
         text = (it.get("text") or "").strip()
@@ -232,11 +206,11 @@ def build_db_rows(period_start: date, period_end: date, items: List[Dict[str, An
         add_to_cart = safe_int(it.get("addToCart"))
         orders = safe_int(it.get("orders"))
 
-        # конверсии: если WB не дал — считаем
         open_to_cart = safe_float(it.get("openToCart"))
         cart_to_order = safe_float(it.get("cartToOrder"))
         open_to_order = safe_float(it.get("openToOrder"))
 
+        # если WB не дал — считаем
         if open_to_cart is None and open_card and open_card > 0 and add_to_cart is not None:
             open_to_cart = add_to_cart / open_card
         if cart_to_order is None and add_to_cart and add_to_cart > 0 and orders is not None:
@@ -248,6 +222,7 @@ def build_db_rows(period_start: date, period_end: date, items: List[Dict[str, An
             load_dttm,
             period_start,
             period_end,
+            top_order_by,
             int(nm_id),
             text,
             avg_position,
@@ -256,7 +231,8 @@ def build_db_rows(period_start: date, period_end: date, items: List[Dict[str, An
             orders,
             open_to_cart,
             cart_to_order,
-            open_to_order
+            open_to_order,
+            Json(it, dumps=lambda x: json.dumps(x, ensure_ascii=False))
         ))
 
     return rows
@@ -267,7 +243,6 @@ def main():
     if not wb_api_key:
         raise RuntimeError("WB_API_KEY пустой")
 
-    # период: по умолчанию вчера (по МСК)
     ps = env_str("PERIOD_START", "")
     pe = env_str("PERIOD_END", "")
 
@@ -279,30 +254,24 @@ def main():
         period_start = y
         period_end = y
 
-    # настройки WB
-    # Ставим дефолт 30 (самый безопасный), а если хочешь — в workflow поставишь LIMIT=100
-    limit = env_int("LIMIT", 30)
+    limit = env_int("LIMIT", 30)               # безопасно, потом можно 100
     top_order_by = env_str("TOP_ORDER_BY", "orders")
 
     conn = pg_connect()
     try:
         nm_ids = fetch_nm_ids_from_db(conn)
 
-        logging.info(f"Период: start={period_start.isoformat()} end={period_end.isoformat()} | TOP={top_order_by} | limit={limit}")
+        logging.info(f"Период: {period_start}..{period_end} | topOrderBy={top_order_by} | limit={limit}")
         logging.info(f"Всего nm_id: {len(nm_ids)}")
-        logging.info(f"Первые 20 nm_id: {nm_ids[:20]}")
 
         with requests.Session() as s:
-            items = fetch_search_texts_for_nmids(
-                s, wb_api_key, period_start, period_end, nm_ids, limit, top_order_by
-            )
+            items = fetch_search_texts(s, wb_api_key, period_start, period_end, nm_ids, limit, top_order_by)
 
         logging.info(f"WB вернул items: {len(items)}")
-        rows = build_db_rows(period_start, period_end, items)
+        rows = build_db_rows(period_start, period_end, top_order_by, items)
         logging.info(f"Подготовили строк для БД: {len(rows)}")
 
         upsert_rows(conn, rows)
-
         logging.info("DONE")
 
     finally:
