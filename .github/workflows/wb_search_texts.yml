@@ -33,7 +33,7 @@ jobs:
           # NM_IDS: "264675414,491601909,523633405"
 
           # Опционально:
-          LIMIT: "100"
+          LIMIT: "30"
           TOP_ORDER_BY: "orders"
           WB_PAUSE_SEC: "21"
         run: |
