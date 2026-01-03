@@ -8,7 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -29,23 +29,20 @@ jobs:
           WB_API_KEY: ${{ secrets.WB_API_KEY }}
           SUPABASE_CONNINFO: ${{ secrets.SUPABASE_CONNINFO }}
 
-          # Тариф (не расширенный Jam) -> лимит 30
           LIMIT: "30"
 
-          # ВЫГРУЖАЕМ ТОЛЬКО ВЧЕРА:
+          # вчера (1 день)
           PERIOD_DAYS: "1"
           PERIOD_END_OFFSET: "1"
 
-          # Максимальный охват по запросам в рамках лимита 30:
           TOP_ORDER_BYS: "openCard,addToCart,openToCart,orders,cartToOrder"
 
-          # батчи nm_id (оставляем как у тебя)
-          NMID_BATCH_SIZE: "10"
+          # компромисс по охвату/времени
+          NMID_BATCH_SIZE: "5"
 
-          # лимиты WB
           WB_PAUSE_SEC: "21"
 
-          # РЕТЕНШН: удаляем данные старше 92 дней
+          # удаляем старше 92 дней
           RETENTION_DAYS: "92"
         run: |
           python wb_search_texts_sync.py
