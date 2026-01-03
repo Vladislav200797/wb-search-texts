@@ -1,212 +1,380 @@
-# wb_search_texts_sync.py
 import os
 import time
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
-import psycopg2.extras
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-
-# === ENV / настройки ===
-PG_DSN = os.environ["SUPABASE_CONN"]  # postgresql://postgres:<PWD>@...pooler.supabase.com:6543/postgres?sslmode=require
-WB_API_KEY = os.environ["WB_SA_API_KEY"].strip()  # HeaderApiKey из Seller Analytics (без Bearer, без пробелов)
-
-TOP_ORDER_BY = os.environ.get("TOP_ORDER_BY", "orders")  # openCard|addToCart|openToCart|orders|cartToOrder
-INCLUDE_SUBSTITUTED = os.environ.get("INCLUDE_SUBSTITUTED", "true").lower() == "true"
-INCLUDE_SEARCH_TEXTS = os.environ.get("INCLUDE_SEARCH_TEXTS", "true").lower() == "true"
-LIMIT = int(os.environ.get("TEXT_LIMIT", "30"))  # 30 (стандарт) или 100 (Продвинутый)
-USE_PAST_PERIOD = os.environ.get("USE_PAST_PERIOD", "false").lower() == "true"
-DAYS_SHIFT = int(os.environ.get("DAYS_SHIFT", "1"))  # 1 = вчера по МСК
-
-# Фильтры каталога (через запятую); сравнение по подстроке (ILIKE ANY)
-WB_FILTER_BRANDS       = [s.strip() for s in os.environ.get("WB_FILTER_BRANDS", "").split(",") if s.strip()]
-WB_FILTER_SUBJECTS     = [s.strip() for s in os.environ.get("WB_FILTER_SUBJECTS", "").split(",") if s.strip()]
-WB_FILTER_VENDOR_CODES = [s.strip() for s in os.environ.get("WB_FILTER_VENDOR_CODES", "").split(",") if s.strip()]
-
-WB_URL = "https://seller-analytics-api.wildberries.ru/api/v2/search-report/product/search-texts"
-HEADERS = {
-    "Authorization": WB_API_KEY,       # ВАЖНО: без "Bearer "
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-}
-
-# МСК (UTC+3 без переходов)
-MSK = timezone(timedelta(hours=3))
+from psycopg2.extras import execute_values
 
 
-def msk_today():
-    return datetime.now(tz=MSK).date()
+# -----------------------------
+# Настройки / константы
+# -----------------------------
+WB_BASE = "https://seller-analytics-api.wildberries.ru"
+EP_SEARCH_TEXTS = f"{WB_BASE}/api/v2/search-report/product/search-texts"
+
+MSK = ZoneInfo("Europe/Moscow")
+UTC = ZoneInfo("UTC")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
 
 
-def get_periods():
-    """Берем вчерашний день по МСК (или сдвиг DAYS_SHIFT)."""
-    end = msk_today() - timedelta(days=DAYS_SHIFT)
-    current = {"start": end.isoformat(), "end": end.isoformat()}
-    past = None
-    if USE_PAST_PERIOD:
-        p = end - timedelta(days=1)
-        past = {"start": p.isoformat(), "end": p.isoformat()}
-    return current, past
+# -----------------------------
+# Утилиты
+# -----------------------------
+def msk_today() -> date:
+    return datetime.now(MSK).date()
 
 
-def fetch_nm_ids(conn):
-    """
-    Достаём уникальные nm_id из public.wb_products_catalog с ILIKE-фильтрами по подстроке.
-    """
-    base_sql = """
-        select distinct c.nm_id
-        from public.wb_products_catalog c
-        where c.nm_id is not null
-    """
-    params = []
-
-    def to_like_patterns(items):
-        return [f"%{s.strip().lower()}%" for s in items if s.strip()]
-
-    brands   = to_like_patterns(WB_FILTER_BRANDS)
-    subjects = to_like_patterns(WB_FILTER_SUBJECTS)
-    vcodes   = to_like_patterns(WB_FILTER_VENDOR_CODES)
-
-    if brands:
-        base_sql += " and lower(trim(c.brand)) ilike any(%s)"
-        params.append(brands)
-    if subjects:
-        base_sql += " and lower(trim(c.subject)) ilike any(%s)"
-        params.append(subjects)
-    if vcodes:
-        base_sql += " and lower(trim(c.vendor_code)) ilike any(%s)"
-        params.append(vcodes)
-
-    base_sql += " order by c.nm_id"
-
-    with conn.cursor() as cur:
-        cur.execute(base_sql, params if params else None)
-        rows = cur.fetchall()
-        ids = [r[0] for r in rows]
-        logging.info(f"Нашли уникальных nm_id: {len(ids)}")
-        logging.info(f"Первые 20 nm_id: {ids[:20]}")
-        return ids
+def parse_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def chunk(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
+def env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else v.strip()
 
 
-def call_api(nm_ids, current_period, past_period):
-    body = {
-        "currentPeriod": current_period,
-        "nmIds": nm_ids,
-        "topOrderBy": TOP_ORDER_BY,
-        "includeSubstitutedSKUs": INCLUDE_SUBSTITUTED,
-        "includeSearchTexts": INCLUDE_SEARCH_TEXTS,
-        "orderBy": {"field": "avgPosition", "mode": "asc"},
-        "limit": LIMIT
+def env_int(name: str, default: int) -> int:
+    v = env_str(name, "")
+    return default if v == "" else int(v)
+
+
+def parse_nm_ids_csv(s: str) -> List[int]:
+    out: List[int] = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if part:
+            out.append(int(part))
+    # unique preserving order
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            uniq.append(x)
+            seen.add(x)
+    return uniq
+
+
+def wb_headers(api_key: str) -> Dict[str, str]:
+    return {
+        "Authorization": api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
-    if past_period:
-        body["pastPeriod"] = past_period
 
-    resp = requests.post(WB_URL, headers=HEADERS, data=json.dumps(body), timeout=60)
 
-    # Развернутая диагностика ошибок (403 и др.)
-    if resp.status_code >= 400:
-        try:
-            msg = resp.json()
-        except Exception:
-            msg = resp.text
+def chunk(lst: List[Any], n: int) -> List[List[Any]]:
+    return [lst[i:i + n] for i in range(0, len(lst), n)]
+
+
+def safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def safe_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Postgres
+# -----------------------------
+def pg_connect() -> psycopg2.extensions.connection:
+    """
+    Поддерживает 2 режима:
+    1) SUPABASE_CONNINFO — готовая строка conninfo (как у тебя в логах)
+    2) набор переменных SUPABASE_HOST/PORT/USER/PASSWORD/DBNAME/SSLMODE/OPTIONS
+    """
+    conninfo = env_str("SUPABASE_CONNINFO", "")
+    if conninfo:
+        logging.info("Using SUPABASE_CONNINFO")
+        return psycopg2.connect(conninfo)
+
+    host = env_str("SUPABASE_HOST")
+    port = env_int("SUPABASE_PORT", 6543)
+    user = env_str("SUPABASE_USER", "postgres")
+    password = env_str("SUPABASE_PASSWORD")
+    dbname = env_str("SUPABASE_DBNAME", "postgres")
+    sslmode = env_str("SUPABASE_SSLMODE", "require")
+    options = env_str("SUPABASE_OPTIONS", "")  # например: project=xxxxx
+
+    if not host or not password:
         raise RuntimeError(
-            f"WB API error {resp.status_code} | nmIds={len(nm_ids)} | "
-            f"topOrderBy={TOP_ORDER_BY} | includeSubstituted={INCLUDE_SUBSTITUTED} | "
-            f"includeSearchTexts={INCLUDE_SEARCH_TEXTS} | limit={LIMIT} | "
-            f"period={current_period} | response={msg}"
+            "Не хватает переменных для подключения. "
+            "Задай SUPABASE_CONNINFO ИЛИ SUPABASE_HOST + SUPABASE_PASSWORD (+ остальное по желанию)."
         )
 
-    payload = resp.json() or {}
-    return payload.get("data", {}).get("items", [])
+    parts = [
+        f"host={host}",
+        f"port={port}",
+        f"user={user}",
+        f"dbname={dbname}",
+        f"sslmode={sslmode}",
+        f"password={password}",
+    ]
+    if options:
+        # options могут быть вида project=... или '-c project=...'
+        parts.append(f"options={options}")
+
+    conninfo_built = " ".join(parts)
+    logging.info("Using built conninfo (host/port/user/dbname/sslmode/options)")
+    return psycopg2.connect(conninfo_built)
 
 
-def upsert_rows(conn, rows):
+def fetch_nm_ids_from_db(conn) -> List[int]:
+    """
+    Берём все nm_id из твоей базы.
+    Я сделал максимально совместимо: пробуем несколько таблиц.
+    ТЫ МОЖЕШЬ ОСТАВИТЬ ТОЛЬКО ОДНУ, ЕСЛИ ЗНАЕШЬ ТОЧНО, ГДЕ У ТЕБЯ nm_id.
+    """
+    candidates = [
+        ("public.wb_products_catalog", "select distinct nm_id from public.wb_products_catalog where nm_id is not null"),
+        ("public.product_directory", "select distinct nm_id from public.product_directory where nm_id is not null"),
+        ("public.wb_orders", "select distinct nm_id from public.wb_orders where nm_id is not null"),
+    ]
+    cur = conn.cursor()
+    for name, sql in candidates:
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            nm_ids = sorted({int(r[0]) for r in rows if r and r[0] is not None})
+            if nm_ids:
+                logging.info(f"Нашли nm_id из {name}: {len(nm_ids)}")
+                return nm_ids
+        except Exception as e:
+            logging.info(f"Таблица/запрос не подошёл ({name}): {e}")
+            conn.rollback()
+    raise RuntimeError(
+        "Не смог найти nm_id ни в одной из таблиц-кандидатов. "
+        "Либо укажи NM_IDS вручную в env, либо скажи мне, где у тебя хранится список nm_id."
+    )
+
+
+def upsert_rows(conn, rows: List[Tuple[Any, ...]]) -> None:
+    """
+    ВАЖНО: rows должны быть СПИСКОМ КОРТЕЖЕЙ (НЕ dict),
+    иначе снова будет can't adapt type 'dict'.
+    """
     if not rows:
+        logging.info("Нет строк для вставки.")
         return
+
     sql = """
     insert into public.wb_search_texts (
-      load_dttm, period_start, period_end, past_start, past_end,
-      nm_id, top_order_by, include_substituted, include_search_texts,
-      rank_in_top, search_text, avg_position, open_card, add_to_cart,
-      open_to_cart, orders, cart_to_order, raw
-    )
-    values %s
-    on conflict (period_start, period_end, nm_id, top_order_by, search_text, include_substituted, include_search_texts)
+      load_dttm,
+      period_start,
+      period_end,
+      nm_id,
+      search_text,
+      avg_position,
+      open_card,
+      add_to_cart,
+      orders,
+      open_to_cart,
+      cart_to_order,
+      open_to_order
+    ) values %s
+    on conflict (period_start, coalesce(period_end, period_start), nm_id, search_text)
     do update set
-      load_dttm = excluded.load_dttm,
-      past_start = excluded.past_start,
-      past_end   = excluded.past_end,
-      rank_in_top = excluded.rank_in_top,
-      avg_position = excluded.avg_position,
-      open_card = excluded.open_card,
-      add_to_cart = excluded.add_to_cart,
-      open_to_cart = excluded.open_to_cart,
-      orders = excluded.orders,
+      load_dttm     = excluded.load_dttm,
+      avg_position  = excluded.avg_position,
+      open_card     = excluded.open_card,
+      add_to_cart   = excluded.add_to_cart,
+      orders        = excluded.orders,
+      open_to_cart  = excluded.open_to_cart,
       cart_to_order = excluded.cart_to_order,
-      raw = excluded.raw;
+      open_to_order = excluded.open_to_order
+    ;
     """
+
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, rows, page_size=1000)
+        execute_values(cur, sql, rows, page_size=1000)
     conn.commit()
+    logging.info(f"Upsert OK: {len(rows)} строк")
 
 
+# -----------------------------
+# WB API
+# -----------------------------
+def wb_post(session: requests.Session, url: str, api_key: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    resp = session.post(url, headers=wb_headers(api_key), data=json.dumps(body), timeout=60)
+    if resp.status_code == 429:
+        raise RuntimeError(f"WB 429 Too Many Requests: {resp.text}")
+    if resp.status_code != 200:
+        raise RuntimeError(f"WB request failed {resp.status_code}: {resp.text}")
+    return resp.json()
+
+
+def fetch_search_texts_for_nmids(
+    session: requests.Session,
+    api_key: str,
+    period_start: date,
+    period_end: date,
+    nm_ids: List[int],
+    limit: int,
+    top_order_by: str,
+    pause_seconds: float
+) -> List[Dict[str, Any]]:
+    """
+    Возвращает "сырые" items из WB.
+    """
+    all_items: List[Dict[str, Any]] = []
+    batches = chunk(nm_ids, 100)  # безопасный батч
+    for i, nm_batch in enumerate(batches, start=1):
+        body = {
+            "currentPeriod": {"start": period_start.isoformat(), "end": period_end.isoformat()},
+            "nmIds": nm_batch,
+            "topOrderBy": top_order_by,  # обычно 'orders'
+            "includeSubstitutedSKUs": True,
+            "includeSearchTexts": True,
+            "orderBy": {"field": "avgPosition", "mode": "asc"},
+            "limit": limit
+        }
+
+        logging.info(f"Запрашиваем пачку nmIds: {len(nm_batch)} (batch {i}/{len(batches)})")
+        js = wb_post(session, EP_SEARCH_TEXTS, api_key, body)
+        data = js.get("data") or {}
+        items = data.get("items") or []
+        for it in items:
+            if isinstance(it, dict):
+                all_items.append(it)
+
+        # лимиты WB — бережно
+        if i < len(batches):
+            logging.info(f"Пауза {pause_seconds} сек (лимиты WB)…")
+            time.sleep(pause_seconds)
+
+    return all_items
+
+
+def build_db_rows(period_start: date, period_end: date, items: List[Dict[str, Any]]) -> List[Tuple[Any, ...]]:
+    """
+    Превращаем items (dict) -> rows (tuple).
+    НИКАКИХ dict в tuples не кладём.
+    """
+    load_dttm = datetime.now(UTC)
+
+    rows: List[Tuple[Any, ...]] = []
+    for it in items:
+        # WB обычно отдаёт nmId в каждом item, подстрахуемся:
+        nm_id = it.get("nmId") or it.get("nmID")
+        search_text = (it.get("text") or "").strip()
+        if not nm_id or not search_text:
+            continue
+
+        avg_position = safe_float(it.get("avgPosition"))
+        open_card = safe_int(it.get("openCard"))
+        add_to_cart = safe_int(it.get("addToCart"))
+        orders = safe_int(it.get("orders"))
+
+        # конверсии (если WB отдаёт — отлично, если нет — посчитаем)
+        open_to_cart = safe_float(it.get("openToCart"))
+        cart_to_order = safe_float(it.get("cartToOrder"))
+        open_to_order = safe_float(it.get("openToOrder"))
+
+        # если не пришло — считаем сами
+        if open_to_cart is None and open_card and open_card > 0 and add_to_cart is not None:
+            open_to_cart = add_to_cart / open_card
+        if cart_to_order is None and add_to_cart and add_to_cart > 0 and orders is not None:
+            cart_to_order = orders / add_to_cart
+        if open_to_order is None and open_card and open_card > 0 and orders is not None:
+            open_to_order = orders / open_card
+
+        row = (
+            load_dttm,
+            period_start,
+            period_end,
+            int(nm_id),
+            search_text,
+            avg_position,
+            open_card,
+            add_to_cart,
+            orders,
+            open_to_cart,
+            cart_to_order,
+            open_to_order
+        )
+        rows.append(row)
+
+    return rows
+
+
+# -----------------------------
+# main
+# -----------------------------
 def main():
-    current_period, past_period = get_periods()
-    logging.info(f"Период: {current_period} | Сравнение: {past_period}")
+    wb_api_key = env_str("WB_API_KEY")
+    if not wb_api_key:
+        raise RuntimeError("WB_API_KEY пустой")
 
-    # Подключение к БД
-    conn = psycopg2.connect(PG_DSN, sslmode="require")
+    # Период
+    period_start_s = env_str("PERIOD_START", "")
+    period_end_s = env_str("PERIOD_END", "")
+
+    if period_start_s and period_end_s:
+        period_start = parse_date(period_start_s)
+        period_end = parse_date(period_end_s)
+    else:
+        # По умолчанию грузим вчера (по МСК)
+        y = msk_today() - timedelta(days=1)
+        period_start = y
+        period_end = y
+
+    # Параметры WB
+    limit = env_int("LIMIT", 100)  # на Jam обычно можно 100
+    top_order_by = env_str("TOP_ORDER_BY", "orders")  # 'orders' самый логичный
+    pause_seconds = float(env_str("WB_PAUSE_SEC", "21"))
+
+    # nm_id
+    nm_ids_env = env_str("NM_IDS", "")
+    nm_ids: List[int]
+
+    conn = pg_connect()
     try:
-        nm_ids = fetch_nm_ids(conn)
-        if not nm_ids:
-            logging.warning("nm_id не найдено (снимите фильтры WB_FILTER_* либо проверьте wb_products_catalog).")
-            return
+        if nm_ids_env:
+            nm_ids = parse_nm_ids_csv(nm_ids_env)
+            logging.info(f"NM_IDS из env: {len(nm_ids)}")
+        else:
+            nm_ids = fetch_nm_ids_from_db(conn)
 
-        all_rows = []
-        for pack in chunk(nm_ids, 50):  # API: максимум 50 nmIds за запрос
-            logging.info(f"Запрашиваем пачку nmIds: {len(pack)}")
-            items = call_api(pack, current_period, past_period)
+        logging.info(f"Период: start={period_start.isoformat()} end={period_end.isoformat()} | TOP={top_order_by} | limit={limit}")
+        logging.info(f"Всего nm_id: {len(nm_ids)}")
+        logging.info(f"Первые 20 nm_id: {nm_ids[:20]}")
 
-            for i, it in enumerate(items, start=1):
-                row = (
-                    datetime.now(timezone.utc),                                      # load_dttm
-                    datetime.fromisoformat(current_period["start"]).date(),          # period_start
-                    datetime.fromisoformat(current_period["end"]).date(),            # period_end
-                    datetime.fromisoformat(past_period["start"]).date() if past_period else None,
-                    datetime.fromisoformat(past_period["end"]).date() if past_period else None,
-                    int(it.get("nmId") or it.get("nm_id") or 0),                     # nm_id
-                    TOP_ORDER_BY,
-                    INCLUDE_SUBSTITUTED,
-                    INCLUDE_SEARCH_TEXTS,
-                    i,                                                               # rank_in_top
-                    it.get("searchText") or "",                                      # search_text
-                    it.get("avgPosition"),                                           # avg_position
-                    it.get("openCard"),                                              # open_card
-                    it.get("addToCart"),                                             # add_to_cart
-                    it.get("conversionToCart") or it.get("openToCart"),              # open_to_cart
-                    it.get("orders"),                                                # orders
-                    it.get("conversionToOrder") or it.get("cartToOrder"),            # cart_to_order
-                    json.dumps(it, ensure_ascii=False),                              # raw
-                )
-                all_rows.append(row)
+        with requests.Session() as s:
+            items = fetch_search_texts_for_nmids(
+                s, wb_api_key, period_start, period_end,
+                nm_ids, limit, top_order_by, pause_seconds
+            )
 
-            # Лимиты WB: 3 запроса / мин → выдерживаем паузу
-            logging.info("Пауза 21 сек (лимиты WB)…")
-            time.sleep(21)
+        logging.info(f"WB вернул items: {len(items)}")
+        rows = build_db_rows(period_start, period_end, items)
+        logging.info(f"Подготовили строк для БД: {len(rows)}")
 
-        upsert_rows(conn, all_rows)
-        logging.info(f"Готово. Записано/обновлено строк: {len(all_rows)}")
+        upsert_rows(conn, rows)
+
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
