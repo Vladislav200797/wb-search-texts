@@ -8,7 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180   # запас под ~1.5 часа + тормоза WB
 
     steps:
       - name: Checkout
@@ -24,25 +24,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run sync (yesterday only + retention 92d)
+      - name: Run sync (yesterday + batch=1 + retention 92d)
         env:
           WB_API_KEY: ${{ secrets.WB_API_KEY }}
           SUPABASE_CONNINFO: ${{ secrets.SUPABASE_CONNINFO }}
 
+          # Тариф (не расширенный Jam) -> лимит 30
           LIMIT: "30"
 
-          # вчера (1 день)
+          # ВЫГРУЖАЕМ ТОЛЬКО ВЧЕРА (1 день)
           PERIOD_DAYS: "1"
           PERIOD_END_OFFSET: "1"
 
+          # Максимальный охват по разным "топам"
           TOP_ORDER_BYS: "openCard,addToCart,openToCart,orders,cartToOrder"
 
-          # компромисс по охвату/времени
-          NMID_BATCH_SIZE: "5"
+          # ВАЖНО: batch=1 (по одному nm_id в запросе)
+          NMID_BATCH_SIZE: "1"
 
+          # Лимиты WB (3 запроса/мин, интервал 20 сек) -> держим 21 сек
           WB_PAUSE_SEC: "21"
 
-          # удаляем старше 92 дней
+          # Ретеншн: удаляем данные старше 92 дней
           RETENTION_DAYS: "92"
         run: |
           python wb_search_texts_sync.py
