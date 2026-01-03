@@ -2,48 +2,39 @@ name: WB Search Texts → Supabase (daily 07:00 MSK)
 
 on:
   schedule:
-    - cron: "0 4 * * *"      # 04:00 UTC == 07:00 MSK
-  workflow_dispatch: {}      # ручной запуск из Actions
-
-permissions:
-  contents: read
+    - cron: "0 4 * * *"  # 07:00 MSK = 04:00 UTC
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run sync script
+      - name: Run sync
         env:
-          # 🔐 Секреты (добавь в Settings → Secrets and variables → Actions)
-          SUPABASE_CONN: ${{ secrets.SUPABASE_CONN }}   # postgresql://postgres:<PWD>@aws-0-eu-north-1.pooler.supabase.com:6543/postgres?sslmode=require
-          WB_SA_API_KEY: ${{ secrets.WB_SA_API_KEY }}   # HeaderApiKey из WB Seller Analytics
+          WB_API_KEY: ${{ secrets.WB_API_KEY }}
 
-          # ⚙️ Параметры метода
-          TOP_ORDER_BY: "orders"                        # openCard|addToCart|openToCart|orders|cartToOrder
-          INCLUDE_SUBSTITUTED: "true"
-          INCLUDE_SEARCH_TEXTS: "true"
-          TEXT_LIMIT: "30"                              # 100 для тарифа «Продвинутый»
-          USE_PAST_PERIOD: "false"
-          DAYS_SHIFT: "1"                               # берём вчера по МСК
+          # Самый удобный вариант — одна строка conninfo:
+          SUPABASE_CONNINFO: ${{ secrets.SUPABASE_CONNINFO }}
 
-          # 🔎 Фильтры каталога (оставь пустыми, чтобы тянуть всё)
-          WB_FILTER_BRANDS: ""                          # напр.: "moorka"
-          WB_FILTER_SUBJECTS: ""                        # напр.: "костюм,костюм детский"
-          WB_FILTER_VENDOR_CODES: ""                    # напр.: "HPsetDark,HPsetBlack"
+          # Если NM_IDS пусто — скрипт сам возьмёт все nm_id из БД
+          # NM_IDS: "264675414,491601909,523633405"
+
+          # Опционально:
+          LIMIT: "100"
+          TOP_ORDER_BY: "orders"
+          WB_PAUSE_SEC: "21"
         run: |
           python wb_search_texts_sync.py
