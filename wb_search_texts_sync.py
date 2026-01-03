@@ -5,7 +5,7 @@ import random
 import logging
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import requests
 import psycopg2
@@ -57,7 +57,6 @@ def pg_connect() -> psycopg2.extensions.connection:
 
 
 def fetch_nm_ids(conn) -> List[int]:
-    # берём все nm_id из твоего справочника товаров
     sql = "select distinct nm_id from public.wb_products_catalog where nm_id is not null"
     with conn.cursor() as cur:
         cur.execute(sql)
@@ -67,10 +66,10 @@ def fetch_nm_ids(conn) -> List[int]:
     return nm_ids
 
 
-def upsert_raw(conn, rows: List[Tuple[Any, ...]]) -> None:
+def upsert_raw(conn, rows: List[Tuple[Any, ...]]) -> int:
     if not rows:
         logging.info("Нет строк для вставки.")
-        return
+        return 0
 
     sql = """
     insert into public.wb_search_texts_raw (
@@ -89,6 +88,19 @@ def upsert_raw(conn, rows: List[Tuple[Any, ...]]) -> None:
         execute_values(cur, sql, rows, page_size=1000)
     conn.commit()
     logging.info(f"Upsert OK: {len(rows)} строк")
+    return len(rows)
+
+
+def delete_old(conn, retention_days: int) -> int:
+    # Храним последние retention_days дней по period_end (по МСК)
+    cutoff = msk_today() - timedelta(days=retention_days)
+    sql = "delete from public.wb_search_texts_raw where period_end < %s;"
+    with conn.cursor() as cur:
+        cur.execute(sql, (cutoff,))
+        deleted = cur.rowcount
+    conn.commit()
+    logging.info(f"Retention: удалили {deleted} строк (period_end < {cutoff})")
+    return deleted
 
 
 # ---------- WB API ----------
@@ -131,13 +143,13 @@ def main():
     if not wb_api_key:
         raise RuntimeError("WB_API_KEY пустой (добавь в GitHub Secrets)")
 
-    # По умолчанию грузим "вчера" по МСК (1 день)
+    # ---- период: по умолчанию вчера (1 день)
     period_days = env_int("PERIOD_DAYS", 1)
     end_offset = env_int("PERIOD_END_OFFSET", 1)  # 1 = вчера
     period_end = msk_today() - timedelta(days=end_offset)
     period_start = period_end - timedelta(days=period_days - 1)
 
-    # Можно руками задать даты через env
+    # можно руками задать конкретные даты
     ps = env_str("PERIOD_START", "")
     pe = env_str("PERIOD_END", "")
     if ps and pe:
@@ -145,13 +157,14 @@ def main():
         period_end = parse_date(pe)
 
     limit_rows = env_int("LIMIT", 30)
+    top_order_bys = [x.strip() for x in env_str(
+        "TOP_ORDER_BYS",
+        "openCard,addToCart,openToCart,orders,cartToOrder"
+    ).split(",") if x.strip()]
 
-    # По умолчанию один режим, чтобы не плодить запросы.
-    # Если хочешь — можешь поставить "orders,openCard,addToCart"
-    top_order_bys = [x.strip() for x in env_str("TOP_ORDER_BYS", "orders").split(",") if x.strip()]
-
-    nmid_batch_size = env_int("NMID_BATCH_SIZE", 300)
+    nmid_batch_size = env_int("NMID_BATCH_SIZE", 10)
     pause_sec = env_int("WB_PAUSE_SEC", 21)
+    retention_days = env_int("RETENTION_DAYS", 92)
 
     conn = pg_connect()
     try:
@@ -164,10 +177,11 @@ def main():
         logging.info(f"Период: {period_start}..{period_end}")
         logging.info(f"top_order_bys={top_order_bys} limit={limit_rows} nm_ids={len(nm_ids)} batches={len(batches)}")
 
+        total_rows = 0
+
         with requests.Session() as s:
             for t_i, top in enumerate(top_order_bys, start=1):
                 for b_i, nm_batch in enumerate(batches, start=1):
-
                     body = {
                         "currentPeriod": {"start": period_start.isoformat(), "end": period_end.isoformat()},
                         "nmIds": nm_batch,
@@ -201,13 +215,15 @@ def main():
                             Json(it, dumps=lambda x: json.dumps(x, ensure_ascii=False))
                         ))
 
-                    upsert_raw(conn, rows)
+                    total_rows += upsert_raw(conn, rows)
 
-                    # пауза между запросами (лимиты WB)
                     if (b_i < len(batches)) or (t_i < len(top_order_bys)):
                         time.sleep(pause_sec + random.uniform(0, 2))
 
-        logging.info("DONE")
+        # чистка истории
+        delete_old(conn, retention_days)
+
+        logging.info(f"DONE. Insert/Upsert rows this run: {total_rows}")
 
     finally:
         try:
