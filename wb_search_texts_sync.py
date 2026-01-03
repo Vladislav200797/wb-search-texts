@@ -11,7 +11,6 @@ import requests
 import psycopg2
 from psycopg2.extras import execute_values, Json
 
-
 WB_BASE = "https://seller-analytics-api.wildberries.ru"
 EP_SEARCH_TEXTS = f"{WB_BASE}/api/v2/search-report/product/search-texts"
 
@@ -47,6 +46,16 @@ def wb_headers(api_key: str) -> Dict[str, str]:
     }
 
 
+def get_current(v: Any) -> Any:
+    """WB часто возвращает метрики как объект {current, percentile}. Берём current."""
+    if isinstance(v, dict):
+        if "current" in v:
+            return v.get("current")
+        if "value" in v:
+            return v.get("value")
+    return v
+
+
 def safe_int(v: Any) -> Optional[int]:
     try:
         if v is None:
@@ -70,7 +79,7 @@ def safe_float(v: Any) -> Optional[float]:
 def pg_connect() -> psycopg2.extensions.connection:
     conninfo = env_str("SUPABASE_CONNINFO", "")
     if not conninfo:
-        raise RuntimeError("SUPABASE_CONNINFO пустой (нужно добавить в GitHub Secrets)")
+        raise RuntimeError("SUPABASE_CONNINFO пустой")
     logging.info("Using SUPABASE_CONNINFO")
     return psycopg2.connect(conninfo)
 
@@ -148,12 +157,12 @@ def wb_post_json(
 
         if resp.status_code == 429:
             sleep_s = min(120, 20 * attempt) + random.uniform(0, 3)
-            logging.warning(f"WB 429 Too Many Requests. Sleep {sleep_s:.1f}s (attempt {attempt}/{max_retries_429})")
+            logging.warning(f"WB 429. Sleep {sleep_s:.1f}s (attempt {attempt}/{max_retries_429})")
             time.sleep(sleep_s)
             continue
 
         text = resp.text or ""
-        logging.error(f"WB ERROR {resp.status_code} on {url}. Response (first 1200 chars): {text[:1200]}")
+        logging.error(f"WB ERROR {resp.status_code} on {url}. Response: {text[:1200]}")
         raise RuntimeError(f"WB request failed: {resp.status_code}")
 
     raise RuntimeError("WB 429: exceeded retries")
@@ -178,7 +187,7 @@ def fetch_search_texts(
         "limit": limit
     }
 
-    logging.info(f"Запрашиваем nmIds: {len(nm_ids)} (limit={limit}, topOrderBy={top_order_by})")
+    logging.info(f"WB request: nmIds={len(nm_ids)} limit={limit} topOrderBy={top_order_by} period={period_start}..{period_end}")
     js = wb_post_json(session, EP_SEARCH_TEXTS, api_key, body)
 
     data = js.get("data") or {}
@@ -201,22 +210,24 @@ def build_db_rows(
         if not nm_id or not text:
             continue
 
-        avg_position = safe_float(it.get("avgPosition"))
-        open_card = safe_int(it.get("openCard"))
-        add_to_cart = safe_int(it.get("addToCart"))
-        orders = safe_int(it.get("orders"))
+        # ВАЖНО: берём current из dict
+        avg_position = safe_float(get_current(it.get("avgPosition")))
+        open_card = safe_int(get_current(it.get("openCard")))
+        add_to_cart = safe_int(get_current(it.get("addToCart")))
+        orders = safe_int(get_current(it.get("orders")))
 
-        open_to_cart = safe_float(it.get("openToCart"))
-        cart_to_order = safe_float(it.get("cartToOrder"))
-        open_to_order = safe_float(it.get("openToOrder"))
+        # WB часто отдаёт конверсии как проценты (0..100)
+        open_to_cart = safe_float(get_current(it.get("openToCart")))
+        cart_to_order = safe_float(get_current(it.get("cartToOrder")))
+        open_to_order = safe_float(get_current(it.get("openToOrder")))
 
-        # если WB не дал — считаем
+        # если WB не дал — считаем сами (тоже в процентах)
         if open_to_cart is None and open_card and open_card > 0 and add_to_cart is not None:
-            open_to_cart = add_to_cart / open_card
+            open_to_cart = (add_to_cart / open_card) * 100.0
         if cart_to_order is None and add_to_cart and add_to_cart > 0 and orders is not None:
-            cart_to_order = orders / add_to_cart
+            cart_to_order = (orders / add_to_cart) * 100.0
         if open_to_order is None and open_card and open_card > 0 and orders is not None:
-            open_to_order = orders / open_card
+            open_to_order = (orders / open_card) * 100.0
 
         rows.append((
             load_dttm,
@@ -243,35 +254,40 @@ def main():
     if not wb_api_key:
         raise RuntimeError("WB_API_KEY пустой")
 
+    # Период: по умолчанию окно N дней, заканчиваем вчера (по МСК)
+    period_days = env_int("PERIOD_DAYS", 7)          # <-- сделай 1, если хочешь строго “вчера”
+    end_offset = env_int("PERIOD_END_OFFSET", 1)     # 1 = вчера
+    end_day = msk_today() - timedelta(days=end_offset)
+    start_day = end_day - timedelta(days=period_days - 1)
+
+    # Можно руками задать конкретный период
     ps = env_str("PERIOD_START", "")
     pe = env_str("PERIOD_END", "")
-
     if ps and pe:
-        period_start = parse_date(ps)
-        period_end = parse_date(pe)
-    else:
-        y = msk_today() - timedelta(days=1)
-        period_start = y
-        period_end = y
+        start_day = parse_date(ps)
+        end_day = parse_date(pe)
 
-    limit = env_int("LIMIT", 30)               # безопасно, потом можно 100
-    top_order_by = env_str("TOP_ORDER_BY", "orders")
+    limit = env_int("LIMIT", 30)
+    top_order_bys = [x.strip() for x in env_str("TOP_ORDER_BYS", "orders,openCard,addToCart").split(",") if x.strip()]
+    pause_sec = env_int("WB_PAUSE_SEC", 21)
 
     conn = pg_connect()
     try:
         nm_ids = fetch_nm_ids_from_db(conn)
-
-        logging.info(f"Период: {period_start}..{period_end} | topOrderBy={top_order_by} | limit={limit}")
-        logging.info(f"Всего nm_id: {len(nm_ids)}")
+        logging.info(f"Период: {start_day}..{end_day} | limit={limit} | top_order_bys={top_order_bys}")
 
         with requests.Session() as s:
-            items = fetch_search_texts(s, wb_api_key, period_start, period_end, nm_ids, limit, top_order_by)
+            for i, top in enumerate(top_order_bys, start=1):
+                items = fetch_search_texts(s, wb_api_key, start_day, end_day, nm_ids, limit, top)
+                logging.info(f"WB items ({top}): {len(items)}")
+                rows = build_db_rows(start_day, end_day, top, items)
+                logging.info(f"Rows for DB ({top}): {len(rows)}")
+                upsert_rows(conn, rows)
 
-        logging.info(f"WB вернул items: {len(items)}")
-        rows = build_db_rows(period_start, period_end, top_order_by, items)
-        logging.info(f"Подготовили строк для БД: {len(rows)}")
+                if i < len(top_order_bys):
+                    logging.info(f"Пауза {pause_sec} сек (лимиты WB)…")
+                    time.sleep(pause_sec)
 
-        upsert_rows(conn, rows)
         logging.info("DONE")
 
     finally:
