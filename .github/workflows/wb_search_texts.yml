@@ -2,18 +2,20 @@ name: WB Search Texts → Supabase (daily 07:00 MSK)
 
 on:
   schedule:
-    - cron: "0 4 * * *"  # 07:00 MSK = 04:00 UTC
+    - cron: "0 4 * * *"   # 07:00 MSK = 04:00 UTC
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -25,16 +27,13 @@ jobs:
       - name: Run sync
         env:
           WB_API_KEY: ${{ secrets.WB_API_KEY }}
-
-          # Самый удобный вариант — одна строка conninfo:
           SUPABASE_CONNINFO: ${{ secrets.SUPABASE_CONNINFO }}
 
-          # Если NM_IDS пусто — скрипт сам возьмёт все nm_id из БД
-          # NM_IDS: "264675414,491601909,523633405"
-
-          # Опционально:
-          LIMIT: "30"
-          TOP_ORDER_BY: "orders"
-          WB_PAUSE_SEC: "21"
+          # --- Настройки выгрузки ---
+          LIMIT: "30"                   # безопасно по лимитам WB, потом можно попробовать 100
+          PERIOD_DAYS: "7"              # окно 7 дней (макс. покрытие по товарам)
+          PERIOD_END_OFFSET: "1"        # 1 = заканчиваем вчера (по МСК)
+          TOP_ORDER_BYS: "orders,openCard,addToCart"   # 3 прогона за запуск
+          WB_PAUSE_SEC: "21"            # пауза между прогонами (лимиты WB)
         run: |
           python wb_search_texts_sync.py
